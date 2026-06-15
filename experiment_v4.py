@@ -1,45 +1,9 @@
-"""
-Эксперимент v4 для курсовой работы (Даваян Д. А., 25ИСТ(м)ИИП).
-
-ДАТАСЕТ: neuralchemy/Prompt-injection-dataset (core), 6274 записей.
-МОДЕЛИ: LogReg, LinearSVC (Platt), CatBoost, Stacking.
-ВЕКТОРИЗАЦИЯ: BERT-эмбеддинги (sentence-transformers, multilingual mini-BERT).
-
-ЗАМЕЧАНИЯ ПРЕПОДАВАТЕЛЯ, КОТОРЫЕ ЗАКРЫВАЕТ ЭТОТ СКРИПТ:
-  1. Размер выборки увеличен в 12 раз (4391 train vs 350) -> нет переобучения
-  2. Готовое разбиение из датасета (group-aware) -> утечек невозможно
-  3. Контекст формируется ВНУТРИ split (train->train, val->val, test->test)
-     -> данные тестовой выборки не попадают в обучение
-  4. Стратификация по 31 категории атак сохраняется (split от авторов датасета)
-  5. Раздельная векторизация prompt и context -> закрывает гипотезу 'контекст важен'
-  6. Анализ матрицы ошибок для всех 4 моделей -> можно судить, нужен ли стекинг
-  7. Числа в коде совпадают с числами в тексте (печатаются явно)
-
-УСТАНОВКА (одна команда):
-    pip install catboost sentence-transformers scikit-learn pandas numpy matplotlib
-
-ЗАПУСК (из папки с тремя CSV):
-    python experiment_v4.py
-
-ВРЕМЯ: ~10-15 минут на CPU (BERT-эмбеддинги 6274 текстов + 4 модели * 3 пространства).
-
-РЕЗУЛЬТАТ:
-    - results_v4.json        — все метрики train/val/test
-    - figs_v4/*.png          — 7 графиков для курсовой
-    - console_output_v4.txt  — полный консольный вывод
-
-ЧТО ПРИСЛАТЬ CLAUDE:
-    1. results_v4.json
-    2. console_output_v4.txt
-    3. Папку figs_v4/ целиком (7 PNG)
-"""
-
 import os, sys, json, time, warnings, random
 import numpy as np
 import pandas as pd
 warnings.filterwarnings('ignore')
 
-# ── Проверка зависимостей ──────────────────────────────────────────────
+
 missing = []
 try:
     from catboost import CatBoostClassifier
@@ -62,12 +26,12 @@ from sklearn.ensemble import StackingClassifier
 from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score,
                               confusion_matrix, classification_report)
 
-# ──────────────────────────────────────────────────────────────────────
+
 RANDOM_STATE = 42
 random.seed(RANDOM_STATE)
 np.random.seed(RANDOM_STATE)
 
-# Файлы датасета (должны лежать рядом со скриптом)
+
 TRAIN_PATH = 'core_train.csv'
 VAL_PATH   = 'core_validation.csv'
 TEST_PATH  = 'core_test.csv'
@@ -79,7 +43,6 @@ for p in [TRAIN_PATH, VAL_PATH, TEST_PATH]:
 
 os.makedirs('figs_v4', exist_ok=True)
 
-# Дублируем вывод в файл
 class Tee:
     def __init__(self, *files): self.files = files
     def write(self, x):
@@ -90,9 +53,6 @@ class Tee:
 log_file = open('console_output_v4.txt', 'w', encoding='utf-8')
 sys.stdout = Tee(sys.__stdout__, log_file)
 
-# =======================================================================
-# 1) ЗАГРУЗКА И ВАЛИДАЦИЯ ДАТАСЕТА
-# =======================================================================
 print("=" * 70)
 print("ЗАГРУЗКА ДАТАСЕТА neuralchemy/Prompt-injection-dataset (core)")
 print("=" * 70)
@@ -107,7 +67,7 @@ for name, df in [('Train', train), ('Val', val), ('Test', test)]:
     b = (df['label']==0).sum(); m = (df['label']==1).sum()
     print(f"  {name}: benign={b} ({b/len(df)*100:.1f}%) | malicious={m} ({m/len(df)*100:.1f}%)")
 
-# ── ПРОВЕРКА УТЕЧЕК (preceptor: 'могут быть лики, проверить pipeline') ──
+
 print(f"\nПроверка утечек по group_id:")
 train_g = set(train['group_id'].dropna())
 val_g   = set(val['group_id'].dropna())
@@ -120,7 +80,7 @@ assert len(train_g & test_g) == 0
 assert len(val_g & test_g) == 0
 print("  УТЕЧЕК НЕТ")
 
-# ── Распределение категорий атак ──
+
 print(f"\nКатегории атак (train, top-10):")
 for cat, n in train['category'].value_counts().head(10).items():
     print(f"  {cat:25s}: {n}")
@@ -130,17 +90,7 @@ print(f"\nДлина prompt (слов):")
 lens = train['text'].str.split().str.len()
 print(f"  min={lens.min()}, max={lens.max()}, mean={lens.mean():.1f}, median={lens.median():.0f}")
 
-# =======================================================================
-# 2) ФОРМИРОВАНИЕ ДИАЛОГОВОГО КОНТЕКСТА (БЕЗ УТЕЧЕК!)
-# =======================================================================
-# preceptor: "по тому как данные докидываются в контекст могут быть лики,
-#             стоит проверить сам pipeline"
-# РЕШЕНИЕ: контекст формируем ВНУТРИ каждого split:
-#          train-context  из train-prompts (без самой записи)
-#          val-context    из val-prompts
-#          test-context   из test-prompts
-# Это гарантирует, что тестовые данные не попадают в признаки обучения.
-# =======================================================================
+
 print("\n" + "=" * 70)
 print("ФОРМИРОВАНИЕ ДИАЛОГОВОГО КОНТЕКСТА (без утечек между split)")
 print("=" * 70)
@@ -173,10 +123,7 @@ print(f"Контекст train -- сформирован только из train
 print(f"Контекст val   -- сформирован только из val   (size pool = {len(X_val)})")
 print(f"Контекст test  -- сформирован только из test  (size pool = {len(X_te)})")
 
-# =======================================================================
-# 3) АНАЛИЗ: "ЧТО ЕСЛИ КЛАСС КОНТЕКСТА ОТЛИЧАЕТСЯ ОТ КЛАССА ПРОМПТА"
-# (preceptor: "когда подмешиваем в контекст, что если класс другой?")
-# =======================================================================
+
 print("\n" + "=" * 70)
 print("АНАЛИЗ: совпадает ли класс контекста с классом промпта")
 print("=" * 70)
@@ -204,9 +151,7 @@ print(f"  Test:  контекст того же класса={s} ({s/len(X_te)*1
 print("Вывод: контекст содержит реплики СМЕШАННЫХ классов, что моделирует")
 print("реалистичную ситуацию диалога (нельзя предсказать класс только по контексту).")
 
-# =======================================================================
-# 4) ВЕКТОРИЗАЦИЯ ТРАНСФОРМЕРНОЙ МОДЕЛЬЮ (mini-BERT)
-# =======================================================================
+
 print("\n" + "=" * 70)
 print("ВЕКТОРИЗАЦИЯ: sentence-transformers paraphrase-multilingual-MiniLM-L12-v2")
 print("=" * 70)
@@ -233,7 +178,7 @@ C_tr  = embed(ctx_tr,  "train contexts")
 C_val = embed(ctx_val, "val   contexts")
 C_te  = embed(ctx_te,  "test  contexts")
 
-# Три типа признакового пространства
+
 def join(a, b): return np.hstack([a, b])
 feature_sets = {
     'prompt_only':    (P_tr, P_val, P_te),
@@ -245,9 +190,7 @@ print(f"  prompt_only:    {P_tr.shape[1]}")
 print(f"  context_only:   {C_tr.shape[1]}")
 print(f"  prompt+context: {P_tr.shape[1]+C_tr.shape[1]}")
 
-# =======================================================================
-# 5) МОДЕЛИ
-# =======================================================================
+
 def make_models():
     """4 алгоритмически различающиеся модели."""
     lr = LogisticRegression(C=1.0, solver='lbfgs', max_iter=1000,
@@ -274,9 +217,7 @@ def make_models():
     return {'LogReg': lr, 'LinearSVC (Platt)': svm,
             'CatBoost': catboost, 'Stacking': stacking}
 
-# =======================================================================
-# 6) ЦИКЛ ЭКСПЕРИМЕНТОВ
-# =======================================================================
+
 def evaluate(model, X, y):
     pred = model.predict(X)
     if hasattr(model, 'predict_proba'):
@@ -319,11 +260,7 @@ for fset_name, (Xtr, Xval, Xte) in feature_sets.items():
         else:
             print(f"   OK: переобучения не наблюдается, dF1m(train-val) = {delta:.3f}")
 
-# =======================================================================
-# 7) АНАЛИЗ МАТРИЦ ОШИБОК ДЛЯ ВСЕХ 4 МОДЕЛЕЙ
-# (preceptor: "анализ нестековых методов на матрицу ошибок,
-#             вдруг нет смысла стекинг использовать")
-# =======================================================================
+
 print("\n" + "=" * 70)
 print("МАТРИЦЫ ОШИБОК ВСЕХ 4 МОДЕЛЕЙ (prompt+context, test)")
 print("=" * 70)
@@ -337,7 +274,7 @@ for mname in ['LogReg', 'LinearSVC (Platt)', 'CatBoost', 'Stacking']:
     print(f"  FN={cm[1,0]:4d}  TP={cm[1,1]:4d}")
     print(f"  Acc={r['acc']:.4f}  F1m={r['f1m']:.4f}  F1b={r['f1b']:.4f}")
 
-# Сравнение со Stacking
+
 print("\nВЫВОД (нужен ли Stacking?):")
 base_f1 = max(results[('prompt+context', m)]['test']['f1m']
               for m in ['LogReg', 'LinearSVC (Platt)', 'CatBoost'])
@@ -349,10 +286,7 @@ else:
     print(f"  Stacking даёт {delta:+.4f} F1m -- стекинг практически НЕ нужен,")
     print(f"  лучшая базовая модель сопоставима со стекингом.")
 
-# =======================================================================
-# 8) ДЕТАЛЬНЫЙ АНАЛИЗ ЛУЧШЕЙ МОДЕЛИ
-# =======================================================================
-# Выберем лучшую модель по F1m на validation set
+
 best_name = max(['LogReg', 'LinearSVC (Platt)', 'CatBoost', 'Stacking'],
                 key=lambda m: results[('prompt+context', m)]['val']['f1m'])
 print(f"\nЛучшая модель по val F1m: {best_name}")
@@ -375,9 +309,7 @@ for atype in sorted(set(attack_types)):
     attack_acc[atype] = (int(correct), int(n))
     print(f"  {atype:25s}: {correct}/{n} ({correct/n*100:.0f}%)")
 
-# =======================================================================
-# 9) СОХРАНЕНИЕ В JSON
-# =======================================================================
+
 def clean(d):
     return {k: float(v) if isinstance(v, (np.floating, np.integer)) else v
             for k, v in d.items() if k not in ('pred', 'prob')}
@@ -408,9 +340,7 @@ with open('results_v4.json', 'w', encoding='utf-8') as f:
     json.dump(results_json, f, ensure_ascii=False, indent=2)
 print("\nСохранено: results_v4.json")
 
-# =======================================================================
-# 10) ГРАФИКИ
-# =======================================================================
+
 import matplotlib
 matplotlib.use('Agg')
 matplotlib.rcParams['font.family'] = 'DejaVu Sans'
